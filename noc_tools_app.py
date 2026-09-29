@@ -1,5 +1,5 @@
 """
-NOC Tools - Code 33 + Code 13 in one window
+NOC Tools - Code 33 + Code 13 in one window (+ Code 33 queue and a health check)
 --------------------------------------------
 - Uses the SAME working logic as code33_app.py and code13_app.py (they must be in the same folder).
 - Its own settings file: noc_tools.ini (CRM + SSH + telnet + run settings for both codes).
@@ -13,16 +13,150 @@ import os
 import queue
 import re
 import threading
+import time
 import traceback
 from tkinter import messagebox, simpledialog
 
 import customtkinter as ctk
+import paramiko
+from playwright.sync_api import TimeoutError as PWTimeout
 
-from code33_app import (APP, CONFIG_PATH, LOG_DIR, Cancelled, build_commands, keyring, parse_message,
-                        run_flow, test_crm, to_local, validate)
+from code33_app import (APP, CONFIG_PATH, CRM, LOG_DIR, Cancelled, Shell, build_commands, keyring,
+                        parse_message, run_flow, test_crm, to_local, validate)
 from code13_app import normalize_local, run_code13, test_code13
+import code33_app
+
+# ----------------------------------------------------------------------------- remembered CRM login
+# Each Windows user types their CRM username + password once; they are kept in Windows Credential Manager
+# and filled in automatically whenever the CRM shows its login page. (Only inside NOC Tools - the separate
+# Code33/Code13 apps keep their manual login.)
+CRM_USER_KEY = "crm_login_user"
+CRM_CREDS = {}          # set by the app right before each run: {"user": ..., "password": ...}
+_manual_login = code33_app.CRM.ensure_login
+
+
+def crm_pw_key(user):
+    return f"crm_login_pw:{user}"
+
+
+def _remembered_login(self, crm_password):
+    p = self.page
+    p.goto(self.c["url"])
+    p.wait_for_load_state("domcontentloaded")
+    p.wait_for_timeout(1500)
+    if not self._login_form_visible():
+        self.log("CRM: already logged in.")
+        return
+    if not CRM_CREDS.get("user") or not CRM_CREDS.get("password"):
+        return _manual_login(self, crm_password)
+    user_sel = self.c.get("login_user_selector") or "input[name='user_name'], #user_name"
+    pw_sel = self.c.get("login_password_selector") or "input[type=password]"
+    btn_sel = self.c.get("login_button_selector") or "#bigbutton, input[type=submit], button[type=submit]"
+    user_box = p.locator(user_sel).locator("visible=true").first
+    if not user_box.count():  # unknown login page -> let the person log in by hand
+        return _manual_login(self, crm_password)
+    self.log(f"CRM: logging in as {CRM_CREDS['user']}...")
+    user_box.fill(CRM_CREDS["user"])
+    p.locator(pw_sel).locator("visible=true").first.fill(CRM_CREDS["password"])
+    p.locator(btn_sel).locator("visible=true").first.click()
+    try:
+        p.locator("input[type=password]:visible").first.wait_for(state="hidden", timeout=20000)
+    except PWTimeout:
+        try:
+            keyring.delete_password(APP, crm_pw_key(CRM_CREDS["user"]))
+        except Exception:
+            pass
+        raise RuntimeError(f"CRM login failed for '{CRM_CREDS['user']}'. The saved CRM password was removed - "
+                           f"you'll be asked for it again on the next run.")
+    p.wait_for_load_state("domcontentloaded")
+    self.log("CRM: logged in.")
+
+
+code33_app.CRM.ensure_login = _remembered_login   # CRM13 (code 13) inherits it too
 
 TOOLS_CONFIG = os.path.join(os.path.dirname(CONFIG_PATH), "noc_tools.ini")
+
+
+def short(err, n=110):
+    text = str(err).strip().splitlines()[0] if str(err).strip() else type(err).__name__
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+# ----------------------------------------------------------------------------- queue: several messages at once
+def split_requests(text):
+    """Cut pasted text into one request per MSISDN= (each Teams message starts with its MSISDN)."""
+    starts = [m.start() for m in re.finditer(r"\bMSISDN(?!\s*2)\s*[:=]", text, re.I)]
+    out = []
+    for i, st in enumerate(starts):
+        seg = text[st: starts[i + 1] if i + 1 < len(starts) else len(text)]
+        out.append({k: re.sub(r"\D", "", v) for k, v in parse_message(seg).items()})
+    return out
+
+
+# ----------------------------------------------------------------------------- health check
+HEALTH_LABELS = ["CRM opens and logs in", "SSH connects", "Telnet logs in"]
+
+
+def health_check(cfg, secrets, report, log):
+    """report(index, state, detail) with state in run / ok / fail. Changes nothing anywhere."""
+    s, t = cfg["ssh"], cfg["telnet"]
+
+    report(0, "run", "Opening the CRM")
+    t0, crm = time.time(), CRM(cfg, log)
+    try:
+        crm.start()
+        crm.ensure_login(secrets.get("crm"))
+        report(0, "ok", f"Logged in ({time.time() - t0:.0f}s)")
+    except Exception as e:
+        log("CRM check failed: " + str(e))
+        report(0, "fail", short(e))
+    finally:
+        try:
+            crm.stop()
+        except Exception:
+            pass
+
+    report(1, "run", f"Connecting to {s['user']}@{s['host']}")
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        t0 = time.time()
+        client.connect(s["host"], int(s.get("port", "22")), s["user"], secrets["ssh"],
+                       look_for_keys=False, allow_agent=False, timeout=15)
+        sh = Shell(client.invoke_shell(width=300, height=200), log)
+        sh.expect(s["shell_prompt"], 20)
+        report(1, "ok", f"{s['user']}@{s['host']} ({time.time() - t0:.0f}s)")
+    except paramiko.AuthenticationException:
+        report(1, "fail", "SSH password rejected. Use Reset saved passwords and run again.")
+        report(2, "fail", "Not checked, SSH failed")
+        client.close()
+        return
+    except Exception as e:
+        log("SSH check failed: " + str(e))
+        report(1, "fail", short(e))
+        report(2, "fail", "Not checked, SSH failed")
+        client.close()
+        return
+
+    report(2, "run", f"telnet {t['host']} {t['port']}")
+    try:
+        t0 = time.time()
+        sh.send(f"telnet {t['host']} {t['port']}")
+        sh.expect(t["login_prompt"], 30)
+        sh.send(t["user"])
+        sh.expect(t["password_prompt"], 20)
+        sh.send(secrets["telnet"], secret=True)
+        out = sh.expect(t["mml_prompt"], 30)
+        prompt = out.strip().splitlines()[-1].strip() if out.strip() else "prompt"
+        report(2, "ok", f"Logged in at {prompt} ({time.time() - t0:.0f}s)")
+        sh.send(t.get("exit_command", "exit;"))
+        time.sleep(1)
+    except Exception as e:
+        log("Telnet check failed: " + str(e))
+        closed = "closed" in str(e).lower()
+        report(2, "fail", "Login rejected (check the telnet password)" if closed else short(e))
+    finally:
+        client.close()
 
 # ----------------------------------------------------------------------------- look
 C = {
@@ -114,6 +248,17 @@ class StepList(ctk.CTkFrame):
     def fail(self):
         if self.current is not None:
             self._paint(self.current, "fail")
+
+    def set_state(self, i, state, detail=None):
+        if 0 <= i < len(self.rows):
+            self._paint(i, state)
+            if state == "run":
+                self.current = i
+            if detail is not None:
+                self.detail(i, detail)
+
+    def set_title(self, text):
+        self.title.configure(text=text)
 
     def result(self, ok, text):
         self.banner.configure(text=text, fg_color=C["ok"] if ok else C["fail"])
@@ -217,7 +362,7 @@ class NocTools(ctk.CTk):
         self.main.grid_columnconfigure(1, weight=2)
         self.main.grid_rowconfigure(1, weight=1)
 
-        self.pages = {"33": self._page33(), "13": self._page13()}
+        self.pages = {"33": self._page33(), "q": self._pageq(), "13": self._page13(), "hc": self._pagehc()}
         self.steps = StepList(self.main)
         self.steps.grid(row=0, column=1, sticky="nsew", padx=(16, 0))
         self._logpanel()
@@ -235,7 +380,7 @@ class NocTools(ctk.CTk):
         ctk.CTkLabel(side, text="SIM fixes for the CRM", font=font(12), text_color=C["muted"]).pack(
             anchor="w", padx=22, pady=(0, 26))
         self.nav = {}
-        for key, text in (("33", "Code 33"), ("13", "Code 13")):
+        for key, text in (("33", "Code 33"), ("q", "Code 33 queue"), ("13", "Code 13"), ("hc", "Health check")):
             b = ctk.CTkButton(side, text=text, anchor="w", height=42, corner_radius=8, font=font(14),
                               fg_color="transparent", hover_color=C["panel"], text_color=C["muted"],
                               command=lambda k=key: self.show(k))
@@ -246,6 +391,10 @@ class NocTools(ctk.CTk):
         self.dry = ctk.BooleanVar(value=False)
         ctk.CTkSwitch(bottom, text="Dry run (change nothing)", variable=self.dry, font=font(12),
                       text_color=C["text"], progress_color=C["run"]).pack(anchor="w", padx=8, pady=(0, 14))
+        self.crm_user_label = ctk.CTkLabel(bottom, text="", font=font(11), text_color=C["muted"], anchor="w",
+                                           justify="left")
+        self.crm_user_label.pack(fill="x", padx=8, pady=(0, 6))
+        self.refresh_crm_user()
         for text, cmd in (("Open log folder", lambda: os.startfile(LOG_DIR)),
                           ("Reset saved passwords", self.reset_passwords)):
             ctk.CTkButton(bottom, text=text, anchor="w", height=34, fg_color="transparent", hover_color=C["panel"],
@@ -326,6 +475,39 @@ class NocTools(ctk.CTk):
                                           ("Test code 13", self.test13, "secondary")])
         return card
 
+    def _pageq(self):
+        card = self._card()
+        self._header(card, "Code 33 queue",
+                     "Paste several Teams messages. Each one is checked, then they run one after another. "
+                     "If one fails, the queue stops so you can look at it.")
+        self.qtext = ctk.CTkTextbox(card, height=110, font=font(12, family=MONO), fg_color=C["field"],
+                                    border_color=C["line"], border_width=1, text_color=C["text"])
+        self.qtext.pack(fill="x", padx=22, pady=(0, 8))
+        self.qtext.bind("<KeyRelease>", lambda e: self.read_queue())
+        self.qtext.bind("<<Paste>>", lambda e: self.after(50, self.read_queue))
+        self.qlist = ctk.CTkScrollableFrame(card, height=150, fg_color=C["bg"], corner_radius=8)
+        self.qlist.pack(fill="x", padx=22)
+        self.qitems, self.qrows = [], []
+        self.qempty = ctk.CTkLabel(self.qlist, text="Requests appear here after you paste the messages.",
+                                   font=font(12), text_color=C["muted"])
+        self.qempty.pack(pady=18)
+        self.btnq = self._buttons(card, [("Run all", self.runq, "primary"),
+                                         ("Stop after this one", self.stopq, "secondary"),
+                                         ("Clear", self.clearq, "secondary")])
+        self.stop_flag = threading.Event()
+        return card
+
+    def _pagehc(self):
+        card = self._card()
+        self._header(card, "Health check",
+                     "Checks that the CRM opens and logs in, SSH connects and telnet logs in. Nothing is changed. "
+                     "Run it at the start of a shift, or when something suddenly stops working.")
+        self.hc_summary = ctk.CTkLabel(card, text="Not checked yet.", font=font(15), text_color=C["muted"],
+                                       anchor="w", justify="left", wraplength=560)
+        self.hc_summary.pack(fill="x", padx=22, pady=(4, 0))
+        self.btnhc = self._buttons(card, [("Run health check", self.run_health, "primary")])
+        return card
+
     def _logpanel(self):
         box = ctk.CTkFrame(self.main, fg_color=C["panel"], corner_radius=12)
         box.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(16, 0))
@@ -348,7 +530,13 @@ class NocTools(ctk.CTk):
         self.pages[key].grid(row=0, column=0, sticky="nsew")
         self.nav[key].configure(fg_color=C["panel"], text_color=C["text"])
         self.page = key
-        self.steps.set_steps(Code33Tracker.LABELS if key == "33" else Code13Tracker.LABELS)
+        self.reset_steps()
+
+    def reset_steps(self):
+        labels = {"33": Code33Tracker.LABELS, "q": Code33Tracker.LABELS, "13": Code13Tracker.LABELS,
+                  "hc": HEALTH_LABELS}[self.page]
+        self.steps.set_title("Checks" if self.page == "hc" else "Steps")
+        self.steps.set_steps(labels)
 
     # --- plumbing
     def log(self, text):
@@ -381,6 +569,14 @@ class NocTools(ctk.CTk):
                     evt.set()
                 elif kind == "done":
                     self.finish(*payload)
+                elif kind == "qitem":
+                    self.paint_qrow(*payload)
+                elif kind == "hc":
+                    self.steps.set_state(*payload)
+                elif kind == "next33":
+                    self.steps.set_steps(Code33Tracker.LABELS)
+                    self.steps.set_title(payload)
+                    self.tracker = Code33Tracker(self.steps, self.cfg)
         except queue.Empty:
             pass
         self.after(100, self.pump)
@@ -394,15 +590,15 @@ class NocTools(ctk.CTk):
         self.bell()
 
     def all_buttons(self):
-        return self.btn33 + self.btn13 + list(self.nav.values())
+        return self.btn33 + self.btn13 + self.btnhc + [self.btnq[0], self.btnq[2]] + list(self.nav.values())
 
     def start_worker(self, action, tracker, target, *args):
         self.busy, self.action = True, action
         for b in self.all_buttons():
             b.configure(state="disabled")
-        self.steps.set_steps(Code33Tracker.LABELS if self.page == "33" else Code13Tracker.LABELS)
+        self.reset_steps()
         self.tracker = tracker
-        name = datetime.datetime.now().strftime(f"noc_code{self.page}_%Y%m%d_%H%M%S.log")
+        name = datetime.datetime.now().strftime(f"noc_{self.page}_%Y%m%d_%H%M%S.log")
         self.logfile = open(os.path.join(LOG_DIR, name), "w", encoding="utf-8")
 
         def work():
@@ -427,7 +623,27 @@ class NocTools(ctk.CTk):
             self.logfile.close()
             self.logfile = None
         self.front()
-        code = "Code " + self.page
+        code = {"33": "Code 33", "q": "Code 33 queue", "13": "Code 13", "hc": "Health check"}[self.page]
+        if self.action == "queue":
+            done, failed, left = self.qresult
+            good = failed == 0 and left == 0
+            text = f"{done} done" + (f", {failed} failed" if failed else "") + (f", {left} not run" if left else "")
+            self.steps.set_title("Steps")
+            self.steps.result(good, ("Dry run: " if self.dry.get() else "") + text + ".")
+            (messagebox.showinfo if good else messagebox.showwarning)(
+                APP, f"Code 33 queue finished\n\n{text}.\n\nThe list shows the result of each request.",
+                parent=self)
+            return
+        if self.action == "health":
+            bad = [HEALTH_LABELS[i] for i, r in enumerate(self.steps.rows) if r["state"] != "ok"]
+            if bad:
+                self.hc_summary.configure(text="Problem: " + ", ".join(bad) + ". The red line says what failed.",
+                                          text_color=C["fail"])
+                self.steps.result(False, f"{len(bad)} of 3 checks failed.")
+            else:
+                self.hc_summary.configure(text=f"All good at {datetime.datetime.now():%H:%M}.", text_color=C["ok"])
+                self.steps.result(True, "All 3 checks passed.")
+            return
         if ok and err == "cancelled":
             self.steps.result(True, "Stopped. Nothing was changed.")
         elif not ok:
@@ -466,21 +682,53 @@ class NocTools(ctk.CTk):
                 "telnet": (f"telnet:{t['user']}@{t['host']}", f"TELNET {t['user']}@{t['host']}"),
                 "crm": ("crm:" + self.cfg["crm"].get("login_user", ""), "CRM")}
 
+    def crm_login(self):
+        """CRM username + password: asked once per Windows user, then remembered."""
+        user = keyring.get_password(APP, CRM_USER_KEY) or ""
+        pw = keyring.get_password(APP, crm_pw_key(user)) if user else None
+        if not user or not pw:
+            user = simpledialog.askstring(APP, "CRM username\n(asked once, then remembered on this PC):",
+                                          initialvalue=user, parent=self)
+            if not user:
+                raise Cancelled()
+            user = user.strip()
+            pw = simpledialog.askstring(APP, f"CRM password for {user}\n(saved in Windows Credential Manager):",
+                                        show="*", parent=self)
+            if not pw:
+                raise Cancelled()
+            keyring.set_password(APP, CRM_USER_KEY, user)
+            keyring.set_password(APP, crm_pw_key(user), pw)
+            self.refresh_crm_user()
+        CRM_CREDS.clear()
+        CRM_CREDS.update(user=user, password=pw)
+
+    def refresh_crm_user(self):
+        user = keyring.get_password(APP, CRM_USER_KEY)
+        self.crm_user_label.configure(text=f"CRM login: {user}" if user else "CRM login: not saved yet")
+
     def secrets(self, need_mml):
         keys, out = self.secret_keys(), {}
+        if self.cfg["crm"].get("remember_login", "yes").lower() in ("yes", "true", "1"):
+            self.crm_login()
+        else:
+            CRM_CREDS.clear()
         if need_mml:
             out["ssh"] = self.secret(*keys["ssh"])
             out["telnet"] = self.secret(*keys["telnet"])
-        if self.cfg["crm"].get("login_user_selector"):
-            out["crm"] = self.secret(*keys["crm"])
         return out
 
     def reset_passwords(self):
-        for key, _ in self.secret_keys().values():
+        keys = [k for k, _ in self.secret_keys().values()]
+        user = keyring.get_password(APP, CRM_USER_KEY)
+        if user:
+            keys += [crm_pw_key(user), CRM_USER_KEY]
+        for key in keys:
             try:
                 keyring.delete_password(APP, key)
             except keyring.errors.PasswordDeleteError:
                 pass
+        CRM_CREDS.clear()
+        self.refresh_crm_user()
         messagebox.showinfo(APP, "Saved passwords cleared. You'll be asked again on the next run.", parent=self)
 
     # --- code 33
@@ -534,6 +782,110 @@ class NocTools(ctk.CTk):
         except Cancelled:
             return
         self.start_worker("test33", Code33Tracker(self.steps, self.cfg), test_crm, self.cfg, v, secrets, self.log)
+
+    # --- code 33 queue
+    def read_queue(self):
+        items = split_requests(self.qtext.get("1.0", "end"))
+        seen = set()
+        for v in items:
+            errs = validate(v)
+            v["_state"], v["_detail"] = ("ok_to_run", "Waiting") if not errs else ("invalid", errs[0])
+            if not errs and v["msisdn"] in seen:
+                v["_state"], v["_detail"] = "invalid", "Same number twice, skipped"
+            seen.add(v["msisdn"])
+        self.qitems = items
+        for w in self.qlist.winfo_children():
+            w.destroy()
+        self.qrows = []
+        if not items:
+            ctk.CTkLabel(self.qlist, text="Requests appear here after you paste the messages.", font=font(12),
+                         text_color=C["muted"]).pack(pady=18)
+            return
+        for i, v in enumerate(items):
+            row = ctk.CTkFrame(self.qlist, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row, text=str(i + 1), width=26, font=font(12, "bold"), text_color=C["muted"]).pack(side="left")
+            num = to_local(v["msisdn"]) if len(v["msisdn"]) == 12 else (v["msisdn"] or "no MSISDN")
+            ctk.CTkLabel(row, text=num, width=120, anchor="w", font=font(13, family=MONO),
+                         text_color=C["text"]).pack(side="left", padx=(6, 8))
+            ctk.CTkLabel(row, text=v["imsi1"] or "-", width=170, anchor="w", font=font(12, family=MONO),
+                         text_color=C["muted"]).pack(side="left")
+            st = ctk.CTkLabel(row, text="", anchor="w", font=font(12), justify="left")
+            st.pack(side="left", fill="x", expand=True, padx=(8, 0))
+            self.qrows.append(st)
+            self.paint_qrow(i, "idle" if v["_state"] == "ok_to_run" else "invalid", v["_detail"])
+
+    def paint_qrow(self, i, state, detail):
+        if 0 <= i < len(self.qrows):
+            color = {"idle": C["muted"], "run": C["run"], "ok": C["ok"], "fail": C["fail"],
+                     "invalid": C["fail"], "skip": C["muted"]}[state]
+            mark = {"ok": "✓ ", "fail": "✕ ", "invalid": "✕ ", "run": "● "}.get(state, "")
+            self.qrows[i].configure(text=mark + detail, text_color=color)
+
+    def clearq(self):
+        self.qtext.delete("1.0", "end")
+        self.read_queue()
+
+    def stopq(self):
+        if self.busy and self.action == "queue":
+            self.stop_flag.set()
+            self.log("Queue: will stop after the current request.")
+
+    def runq(self):
+        if self.busy:
+            return
+        self.read_queue()
+        todo = [i for i, v in enumerate(self.qitems) if v["_state"] == "ok_to_run"]
+        if not todo:
+            messagebox.showerror(APP, "No valid requests to run. Paste the Teams messages first.", parent=self)
+            return
+        nums = "\n".join(f"  {to_local(self.qitems[i]['msisdn'])}" for i in todo)
+        if not self.dry.get() and not messagebox.askyesno(
+                APP, f"Run code 33 for {len(todo)} request(s), one after another?\n\n{nums}", parent=self):
+            return
+        try:
+            secrets = {} if self.dry.get() else self.secrets(need_mml=True)
+        except Cancelled:
+            return
+        self.stop_flag.clear()
+        self.qresult = (0, 0, len(todo))
+        self.start_worker("queue", None, self.work_queue, todo, secrets, self.dry.get())
+
+    def work_queue(self, todo, secrets, dry):
+        done = failed = 0
+        for pos, i in enumerate(todo):
+            v = self.qitems[i]
+            if self.stop_flag.is_set() or failed:
+                for j in todo[pos:]:
+                    self.q.put(("qitem", (j, "skip", "Not run")))
+                break
+            num = to_local(v["msisdn"])
+            self.q.put(("qitem", (i, "run", "Running")))
+            self.q.put(("next33", f"Request {pos + 1} of {len(todo)}: {num}"))
+            self.log(f"===== Request {pos + 1}/{len(todo)}: {num} =====")
+            try:
+                run_flow(self.cfg, v, secrets, self.log, dry)
+                done += 1
+                self.q.put(("qitem", (i, "ok", "Dry run" if dry else "Done")))
+            except Exception as e:
+                failed += 1
+                self.log("ERROR: " + str(e))
+                self.log(traceback.format_exc())
+                self.q.put(("qitem", (i, "fail", short(e, 70))))
+        left = len(todo) - done - failed
+        self.qresult = (done, failed, left)
+
+    # --- health check
+    def run_health(self):
+        if self.busy:
+            return
+        try:
+            secrets = self.secrets(need_mml=True)
+        except Cancelled:
+            return
+        self.hc_summary.configure(text="Checking…", text_color=C["run"])
+        report = lambda i, state, detail: self.q.put(("hc", (i, state, detail)))
+        self.start_worker("health", None, health_check, self.cfg, secrets, report, self.log)
 
     # --- code 13
     def values13(self):
