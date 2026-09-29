@@ -1,5 +1,6 @@
 # real settings (internal IPs/users) stay on the PCs only
 config.ini
+config13.ini
 
 # build output
 build/

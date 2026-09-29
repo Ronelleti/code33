@@ -1,5 +1,5 @@
 """
-Code 13 helper  (separate app - uses the same config.ini, CRM login and log folder as Code 33)
+Code 13 helper  (separate app with its own config13.ini - reuses the CRM login code from code33_app.py)
 --------------
 Line has code 13 = the IMSI in the network (EDA) is different from the IMSI in the CRM.
 1. Read the line's SIM in the CRM (the correct IMSI) + network status
@@ -27,6 +27,9 @@ from playwright.sync_api import TimeoutError as PWTimeout
 # shared parts from the code 33 app (browser/CRM login, config, passwords)
 from code33_app import APP, CONFIG_PATH, CRM, LOG_DIR, Cancelled, keyring, simpledialog
 
+# code 13 has its own settings file, next to the app
+CONFIG13_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "config13.ini")
+
 
 IMSI_RE = re.compile(r"\b425\d{12}\b")
 ICCID_RE = re.compile(r"\b89\d{15,18}\b")
@@ -43,6 +46,15 @@ def normalize_local(number):
 
 class CRM13(CRM):
     """Extra CRM actions for code 13: the line's SIM table, בחר window, detach, network status."""
+
+    def snapshot(self, name):
+        """Save a screenshot of the browser to the log folder (for debugging)."""
+        try:
+            path = os.path.join(LOG_DIR, datetime.datetime.now().strftime(f"code13_%H%M%S_{name}.png"))
+            self.page.screenshot(path=path, full_page=True)
+            self.log(f"   screenshot saved: {path}")
+        except Exception:
+            pass
 
     # --- the line's SIMS INVENTORY table
     def sims_table(self):
@@ -67,7 +79,12 @@ class CRM13(CRM):
         """{imsi: row text} of the SIMs attached to the line."""
         self.open_subscriber(local)
         table = self.ensure_sims_open()
-        rows = table.locator("tbody tr")
+        try:
+            table.locator("tr").filter(has_text=IMSI_RE).first.wait_for(state="visible", timeout=10000)
+        except PWTimeout:
+            self.log("CRM: ⚠ no SIM rows found in the line's SIMS INVENTORY")
+            self.snapshot("no_sim_rows")
+        rows = table.locator("tr")
         out = {}
         for i in range(rows.count()):
             txt = rows.nth(i).inner_text()
@@ -89,6 +106,33 @@ class CRM13(CRM):
         row.get_by_text(self.c["edit_text"]).first.click()
         p.locator("select:visible", has=p.locator("option", has_text=self.c["status_in_use"])).first.wait_for()
 
+    def _open_edit_direct(self, local, imsi):
+        """Open the SIM record (click the IMSI) and press עריכה there.
+        The subpanel עריכה re-links the SIM to the line on save, so detaching must be done this way."""
+        p = self.page
+        self.open_subscriber(local)
+        table = self.ensure_sims_open()
+        link = table.locator("a", has_text=imsi).locator("visible=true").first
+        try:
+            link.wait_for(state="visible", timeout=15000)
+        except PWTimeout:
+            raise RuntimeError(f"CRM: IMSI {imsi} is not in this line's SIMS INVENTORY.")
+        link.click()
+        p.wait_for_load_state("domcontentloaded")
+        t = self.c["edit_text"]
+        btn = p.locator(f"#edit_button, input[value='{t}'], button:text-is('{t}'), a:text-is('{t}')").locator(
+            "visible=true").first
+        btn.wait_for(state="visible")
+        btn.click()
+        p.locator("select:visible", has=p.locator("option", has_text=self.c["status_in_use"])).first.wait_for()
+        # just in case: anything that would link the record back to a parent on save
+        for n in ("relate_to", "relate_id", "return_relationship"):
+            f = p.locator(f"input[name='{n}']")
+            for i in range(f.count()):
+                if f.nth(i).input_value():
+                    self.log(f"CRM: clearing hidden '{n}' = {f.nth(i).input_value()}")
+                    f.nth(i).evaluate("e => e.value = ''")
+
     def _choose_status(self, target):
         p = self.page
         select = p.locator("select:visible", has=p.locator("option", has_text=target)).first
@@ -98,37 +142,73 @@ class CRM13(CRM):
     def _save(self):
         p = self.page
         t = self.c["save_text"]
-        p.get_by_role("button", name=t).or_(
+        btn = p.get_by_role("button", name=t).or_(
             p.locator(f"input[type=submit][value='{t}'], input[type=button][value='{t}']")
-        ).first.click()
+        ).locator("visible=true").first
+        btn.click()
+        try:  # after a real save the CRM leaves the edit form, so the save button disappears
+            btn.wait_for(state="hidden", timeout=15000)
+        except PWTimeout:
+            msgs = p.locator(".validation-message, .error, .alert-danger").locator("visible=true").all_inner_texts()
+            self.snapshot("save_failed")
+            raise RuntimeError("CRM: the save did not go through (still on the edit form). "
+                               + (" / ".join(m.strip() for m in msgs if m.strip()) or ""))
         p.wait_for_load_state("domcontentloaded")
         p.wait_for_timeout(1500)
 
-    def _mobile_sub_field(self):
+    def _mobile_sub_field(self, local):
+        """The Mobile Subscription field = the text box that shows this line's number, and its X button."""
         p = self.page
+        box = p.locator(f"input[type=text][value='{local}']").locator("visible=true").first
+        if box.count():
+            name = box.get_attribute("name") or ""
+            btn = p.locator(f"button[name='btn_clr_{name}']").first
+            if name and btn.count():
+                self.log(f"CRM: Mobile Subscription field = '{name}' (shows {local})")
+                return box, btn
+        # fallback: by the label text
         label = self.c.get("mobile_sub_label", "Mobile Subscription")
-        item = p.locator(".edit-view-row-item", has=p.get_by_text(label, exact=False)).locator("visible=true").first
+        item = p.locator(".edit-view-row-item", has=p.get_by_text(label, exact=False)).locator("visible=true").last
+        box = item.locator("input[type=text]").first
         btn = item.locator("button[name^='btn_clr_']").first
-        if not item.count() or not btn.count():
+        if not box.count() or not btn.count():
+            self.snapshot("no_mobile_sub_field")
             raise RuntimeError(f"CRM: could not find the X next to '{label}' in the edit form.")
-        return item, btn
+        self.log(f"CRM: Mobile Subscription field (by label) = '{box.get_attribute('name')}' "
+                 f"value '{box.input_value()}'")
+        return box, btn
 
     def edit_sim(self, local, imsi, status=None, detach=False):
         what = f"status -> {status}" if status else "remove Mobile Subscription (X)"
         self.log(f"CRM: IMSI {imsi}: {what}")
-        self._open_edit(local, imsi)
+        if detach:
+            self._open_edit_direct(local, imsi)
+        else:
+            self._open_edit(local, imsi)
         if status:
             self._choose_status(status)
         if detach:
-            item, btn = self._mobile_sub_field()
+            box, btn = self._mobile_sub_field(local)
+            name = box.get_attribute("name") or ""
             btn.click()
-            left = item.locator("input[type=text]").first.input_value().strip()
+            self.page.wait_for_timeout(300)
+            left = box.input_value().strip()
             if left:
                 raise RuntimeError(f"CRM: Mobile Subscription was not cleared (still '{left}').")
+            # the matching hidden id field (xxx_name -> xxx_id) must be empty too
+            if name.endswith("_name"):
+                hid = self.page.locator(f"input[name='{name[:-5]}_id']").first
+                if hid.count() and hid.input_value():
+                    hid.evaluate("e => e.value = ''")
+                    self.log(f"CRM: also cleared hidden field {name[:-5]}_id")
         self._save()
         rows = self.sim_rows(local)
         if detach:
             if imsi in rows:
+                self.page.wait_for_timeout(3000)
+                rows = self.sim_rows(local)
+            if imsi in rows:
+                self.snapshot("still_on_line")
                 raise RuntimeError(f"CRM: IMSI {imsi} is still on the line after removing Mobile Subscription.")
             self.log(f"CRM: verified {imsi} is no longer on the line.")
         else:
@@ -168,6 +248,15 @@ class CRM13(CRM):
         if len(with_iccid) != 1:
             pop.close()
             raise RuntimeError(f"CRM: expected exactly 1 result with an ICCID for IMSI {imsi}, found {len(with_iccid)}.")
+        row_text = with_iccid[0].inner_text()
+        other_lines = sorted(set(re.findall(r"\b05\d{8}\b", row_text)) - {local})
+        if other_lines or self.c["status_in_use"] in row_text:
+            pop.close()
+            raise RuntimeError(
+                f"CRM: SIM {imsi} is {self.c['status_in_use'] if self.c['status_in_use'] in row_text else 'in the list'}"
+                + (f" and attached to another line ({', '.join(other_lines)})" if other_lines else "")
+                + ". It must be suspended/freed first - the app will not take a SIM from another line."
+            )
         return pop, with_iccid[0]
 
     def attach_sim(self, local, imsi):
@@ -191,17 +280,29 @@ class CRM13(CRM):
         p = self.page
         self.open_subscriber(local)
         t = self.c.get("net_status_text", "סטטוס מנוי ברשת")
-        p.locator(f"input[value='{t}'], button:has-text('{t}'), a:has-text('{t}')").locator("visible=true").first.click()
-        rx = re.compile(r"Code:\s*\d+|CONNECTED", re.I)
+        btn = p.get_by_role("button", name=t).or_(
+            p.locator(f"input[value*='{t}'], button:has-text('{t}'), a:has-text('{t}')")
+        ).locator("visible=true").first
+        try:
+            btn.wait_for(state="visible", timeout=10000)
+        except PWTimeout:
+            self.snapshot("no_status_button")
+            raise RuntimeError(f"CRM: could not find the '{t}' button on the line's page.")
+        btn.click()
+        rx = re.compile(r"Code:\s*\d+[^\n]*|NOT\s+CONNECTED|CONNECTED", re.I)
         text, deadline = "", time.time() + 30
         while time.time() < deadline and not text:
-            dlg = p.locator(".ui-dialog, .modal-dialog, [role=dialog]").locator("visible=true")
+            p.wait_for_timeout(700)
+            dlg = p.locator(".ui-dialog, .modal, .modal-dialog, .bootbox, [role=dialog]").locator("visible=true")
             for i in range(dlg.count()):
                 if rx.search(dlg.nth(i).inner_text()):
                     text = dlg.nth(i).inner_text()
-            if not text:
-                p.wait_for_timeout(500)
+            if not text:  # fallback: look at the whole visible page
+                m = rx.search(p.locator("body").inner_text())
+                if m:
+                    text = m.group(0)
         if not text:
+            self.snapshot("no_network_status")
             raise RuntimeError("CRM: the network status window did not show a result.")
         try:
             p.get_by_text(self.c.get("close_text", "סגירה"), exact=True).locator("visible=true").first.click(timeout=3000)
@@ -319,8 +420,8 @@ def test_code13(cfg, v, secrets, log):
         crm.network_status(local)
         in_use = [i for i, t in rows.items() if cfg["crm"]["status_in_use"] in t]
         if len(in_use) == 1:
-            crm._open_edit(local, in_use[0])
-            item, btn = crm._mobile_sub_field()
+            crm._open_edit_direct(local, in_use[0])
+            box, btn = crm._mobile_sub_field(local)
             btn.highlight()
             log("CRM: found the X next to Mobile Subscription (NOT clicked).")
             crm.page.wait_for_timeout(3000)
@@ -344,8 +445,8 @@ class App13:
         self.busy = False
         self.logfile = None
         self.cfg = configparser.ConfigParser(interpolation=None)
-        if not self.cfg.read(CONFIG_PATH, encoding="utf-8"):
-            messagebox.showerror(APP, f"config.ini not found next to the app:\n{CONFIG_PATH}")
+        if not self.cfg.read(CONFIG13_PATH, encoding="utf-8"):
+            messagebox.showerror(APP, f"config13.ini not found next to the app:\n{CONFIG13_PATH}")
             root.destroy()
             return
         os.makedirs(LOG_DIR, exist_ok=True)
