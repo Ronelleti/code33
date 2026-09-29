@@ -33,7 +33,8 @@ DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
 PROFILE_DIR = os.path.join(DATA_DIR, "browser-profile")
 LOG_DIR = os.path.join(DATA_DIR, "logs")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][AB012]")
+# terminal colour codes + invisible control characters (the server ends its prompt with \x0f)
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][AB012]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 class Cancelled(Exception):
@@ -105,6 +106,7 @@ class CRM:
             PROFILE_DIR,
             channel=self.c.get("browser_channel", "msedge"),
             headless=False,
+            chromium_sandbox=True,  # removes the "--no-sandbox" warning bar
             no_viewport=True,
             args=["--start-maximized"],
         )
@@ -123,40 +125,68 @@ class CRM:
     def _search_box(self):
         return self.page.locator(self.c["search_selector"]).first
 
+    def _login_form_visible(self):
+        return self.page.locator("input[type=password]:visible").count() > 0
+
     def ensure_login(self, crm_password):
         p = self.page
         p.goto(self.c["url"])
-        try:
-            self._search_box().wait_for(state="visible", timeout=8000)
+        p.wait_for_load_state("domcontentloaded")
+        p.wait_for_timeout(1500)
+        if not self._login_form_visible():
+            self.log("CRM: already logged in.")
             return
-        except PWTimeout:
-            pass
         if self.c.get("login_user_selector") and crm_password:
             self.log("CRM: logging in...")
             p.locator(self.c["login_user_selector"]).first.fill(self.c.get("login_user", ""))
             p.locator(self.c["login_password_selector"]).first.fill(crm_password)
             p.locator(self.c["login_button_selector"]).first.click()
-            self._search_box().wait_for(state="visible", timeout=30000)
+            p.locator("input[type=password]:visible").first.wait_for(state="hidden", timeout=30000)
         else:
             self.log("CRM: please log in in the browser window (waiting up to 3 minutes)...")
-            self._search_box().wait_for(state="visible", timeout=180000)
+            p.locator("input[type=password]:visible").first.wait_for(state="hidden", timeout=180000)
+        p.wait_for_load_state("domcontentloaded")
         self.log("CRM: logged in.")
 
     def open_subscriber(self, local):
         p = self.page
-        p.goto(self.c["url"])
-        box = self._search_box()
-        box.fill(local)
-        box.press("Enter")
-        link = p.locator("a", has_text=local).first
+        search_url = self.c.get("search_url", "").strip()
+        if search_url:
+            # open the search results page directly - no need to find the search box
+            p.goto(search_url.format(query=local))
+        else:
+            p.goto(self.c["url"])
+            box = self._search_box()
+            box.fill(local)
+            box.press("Enter")
+        # the number also appears in the hidden "recently viewed" menu, so only take a visible link
+        link = p.locator("a", has_text=local).locator("visible=true").first
         link.wait_for(state="visible")
         link.click()
-        p.get_by_text(self.c["sims_section_text"], exact=False).first.wait_for(state="visible")
+        # the same text also exists in the (hidden) top menu, so only look at visible matches
+        p.get_by_text(self.c["sims_section_text"], exact=False).locator("visible=true").first.wait_for(
+            state="visible"
+        )
 
     def sim_row(self, imsi):
         p = self.page
-        row = p.locator("tr", has_text=imsi).filter(has=p.get_by_text(self.c["edit_text"])).first
-        row.wait_for(state="visible")
+        row = (p.locator("tr", has_text=imsi).filter(has=p.get_by_text(self.c["edit_text"]))
+               .locator("visible=true").first)
+        try:
+            row.wait_for(state="visible", timeout=3000)  # section already open
+            return row
+        except PWTimeout:
+            pass
+        # SIMS INVENTORY is collapsed (+) -> click its header to open it, then wait for the table to load
+        self.log("CRM: opening SIMS INVENTORY...")
+        header = p.get_by_text(self.c["sims_section_text"], exact=False).locator("visible=true").first
+        header.scroll_into_view_if_needed()
+        header.click()
+        try:
+            row.wait_for(state="visible")
+        except PWTimeout:
+            raise RuntimeError(f"CRM: IMSI {imsi} was not found in SIMS INVENTORY for this number.")
+        row.scroll_into_view_if_needed()
         return row
 
     def set_status(self, local, imsi, target):
