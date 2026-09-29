@@ -1,0 +1,16 @@
+# real settings (internal IPs/users) stay on the PCs only
+config.ini
+
+# build output
+build/
+dist/
+*.spec
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# logs
+*.log
