@@ -160,7 +160,8 @@ class CRM:
             box.fill(local)
             box.press("Enter")
         # the number also appears in the hidden "recently viewed" menu, so only take a visible link
-        link = p.locator("a", has_text=local).locator("visible=true").first
+        # skip the "recently viewed" side menu (it also shows the number) - take the link in the results
+        link = p.locator("a:not(.recent-links-detail)", has_text=local).locator("visible=true").first
         link.wait_for(state="visible")
         link.click()
         # the same text also exists in the (hidden) top menu, so only look at visible matches
