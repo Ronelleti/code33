@@ -256,14 +256,54 @@ class Shell:
                 time.sleep(0.1)
 
 
+STATUS_RE = re.compile(r"(\d+)\s+([A-Z]+)\s+CUDBSUE")
+BUSY_FAULTS = ("1093", "1098")  # too many transactions at once / no free handler -> wait and retry
+
+
+def run_one(sh, cmd, t, r, log):
+    """Send one command and wait until the CUDB reports its FINAL result (not just ORDERED)."""
+    timeout = int(r.get("result_timeout", "30"))
+    sh.send(cmd)
+    out = sh.expect(t["mml_prompt"], timeout)
+    m = STATUS_RE.search(out)
+    if not m:
+        return "UNKNOWN", out
+    job, status = m.groups()
+    if status == "ORDERED":
+        # the job was queued - its result is printed later as "<job> <STATUS> CUDBSUE ..."
+        try:
+            res = sh.expect(rf"(^|[\r\n])\s*{job}\s+(?!ORDERED)[A-Z]+", timeout)
+            res += sh.expect(t["mml_prompt"], 15)
+            status = re.search(rf"{job}\s+(?!ORDERED)([A-Z]+)", res).group(1)
+            out += res
+        except TimeoutError:
+            log(f"  ⚠ job {job}: no final result within {timeout}s")
+            return "NO RESULT", out
+    return status, out
+
+
+def run_with_retry(sh, cmd, t, r, log):
+    retries, wait = int(r.get("busy_retries", "5")), float(r.get("busy_wait", "3"))
+    for attempt in range(retries + 1):
+        status, out = run_one(sh, cmd, t, r, log)
+        fault = re.search(r"FAULT CODE (\d+)", out)
+        if status == "FAILED" and fault and fault.group(1) in BUSY_FAULTS and attempt < retries:
+            log(f"  … CUDB busy (fault {fault.group(1)}), retry {attempt + 1}/{retries} in {wait:g}s")
+            time.sleep(wait)
+            continue
+        return status
+
+
 def run_mml(cfg, secrets, commands, log):
     s, t, r = cfg["ssh"], cfg["telnet"], cfg["run"]
-    repeat, cmd_timeout = int(r.get("repeat", "3")), int(r.get("command_timeout", "30"))
+    repeat = int(r.get("repeat", "3"))
+    delay = float(r.get("command_delay", "0.3"))
     log(f"SSH: connecting to {s['user']}@{s['host']}...")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(s["host"], int(s.get("port", "22")), s["user"], secrets["ssh"],
                    look_for_keys=False, allow_agent=False, timeout=20)
+    ok = set()
     try:
         sh = Shell(client.invoke_shell(width=300, height=200), log)
         sh.expect(s["shell_prompt"], 20)
@@ -276,16 +316,24 @@ def run_mml(cfg, secrets, commands, log):
         log("TELNET: logged in.")
         for i in range(1, repeat + 1):
             log(f"--- round {i}/{repeat} ---")
-            for cmd in commands:
-                sh.send(cmd)
-                out = sh.expect(t["mml_prompt"], cmd_timeout)
-                if re.search(r"NOT ACCEPTED|FAULT", out, re.I):
-                    log(f"  ⚠ {cmd} returned an error (see output above)")
+            good = 0
+            for n, cmd in enumerate(commands):
+                status = run_with_retry(sh, cmd, t, r, log)
+                if status in ("FAILED", "UNKNOWN", "NO RESULT"):
+                    log(f"  ✖ {status}: {cmd}")
+                else:
+                    ok.add(n)
+                    good += 1
+                time.sleep(delay)
+            log(f"--- round {i}: {good}/{len(commands)} OK ---")
         sh.send(t.get("exit_command", "exit;"))
         time.sleep(1)
     finally:
         client.close()
-    log("TELNET: done.")
+    failed = [c for n, c in enumerate(commands) if n not in ok]
+    if failed:
+        raise RuntimeError(f"{len(failed)} command(s) did not succeed in any round:\n" + "\n".join(failed))
+    log(f"TELNET: done - all {len(commands)} commands succeeded.")
 
 
 # ----------------------------------------------------------------------------- full flow
@@ -402,6 +450,7 @@ class App:
                         self.logfile.flush()
                 elif kind == "done":
                     self.finish(*payload)
+
         except queue.Empty:
             pass
         self.root.after(100, self.pump)

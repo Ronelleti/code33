@@ -38,6 +38,15 @@ from code33_app import APP, CRM, LOG_DIR, Cancelled, keyring, simpledialog
 CONFIG13_PATH = os.path.join(HERE, "config13.ini")
 
 
+def icon_path(name):
+    """The app's .ico - inside the exe (PyInstaller) or in the icons folder next to the .py."""
+    base = getattr(sys, "_MEIPASS", HERE)
+    for p in (os.path.join(base, "icons", name), os.path.join(HERE, "icons", name)):
+        if os.path.exists(p):
+            return p
+    return None
+
+
 IMSI_RE = re.compile(r"\b425\d{12}\b")
 ICCID_RE = re.compile(r"\b89\d{15,18}\b")
 
@@ -548,6 +557,11 @@ class App13:
         os.makedirs(LOG_DIR, exist_ok=True)
 
         root.title("Code 13")
+        try:
+            if icon_path("code13.ico"):
+                root.iconbitmap(icon_path("code13.ico"))
+        except Exception:
+            pass
         root.geometry("900x650")
         frm = ttk.Frame(root, padding=10)
         frm.pack(fill="both", expand=True)

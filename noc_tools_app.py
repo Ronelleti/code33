@@ -85,6 +85,15 @@ code33_app.CRM.ensure_login = _remembered_login   # CRM13 (code 13) inherits it 
 TOOLS_CONFIG = os.path.join(HERE, "noc_tools.ini")
 
 
+def icon_path(name):
+    """The app's .ico - inside the exe (PyInstaller) or in the icons folder next to the .py."""
+    base = getattr(sys, "_MEIPASS", HERE)
+    for p in (os.path.join(base, "icons", name), os.path.join(HERE, "icons", name)):
+        if os.path.exists(p):
+            return p
+    return None
+
+
 def short(err, n=110):
     text = str(err).strip().splitlines()[0] if str(err).strip() else type(err).__name__
     return text if len(text) <= n else text[: n - 1] + "…"
@@ -362,6 +371,9 @@ class NocTools(ctk.CTk):
         self.q, self.busy, self.logfile, self.tracker = queue.Queue(), False, None, None
 
         self.title("NOC Tools")
+        ico = icon_path("noc_tools.ico")
+        if ico:  # customtkinter sets its own icon after start, so set ours a moment later
+            self.after(300, lambda: self.iconbitmap(ico))
         self.geometry("1180x800")
         self.minsize(1000, 680)
         self.configure(fg_color=C["bg"])
@@ -661,7 +673,10 @@ class NocTools(ctk.CTk):
             self.steps.result(True, "Stopped. Nothing was changed.")
         elif not ok:
             untouched = self.page == "13" and self.steps.current is not None and self.steps.current <= 1
+            restored = "was put back on the line" in str(err)
             self.steps.result(False, "Stopped before changing anything. Nothing was changed." if untouched else
+                              "Stopped in the middle - the correct SIM was put back. The line is as before."
+                              if restored else
                               f"{code} stopped at the red step. The log says what to finish by hand.")
             messagebox.showerror(APP, f"{code} failed\n\n{err}\n\nThe log has the details.", parent=self)
         elif self.action.startswith("run") and self.dry.get():
