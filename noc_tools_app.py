@@ -1,7 +1,7 @@
 """
 NOC Tools - Code 33 + Code 13 in one window (+ Code 33 queue and a health check)
 --------------------------------------------
-- Uses the SAME working logic as code33_app.py and code13_app.py (they must be in the same folder).
+- Uses the SAME working logic as code33_app.py and code13_app.py (same folder, or ../code33 and ../code13).
 - Its own settings file: noc_tools.ini (CRM + SSH + telnet + run settings for both codes).
 - Shows every run as a live list of steps, so you can see where it is and where it stopped.
 
@@ -21,7 +21,15 @@ import customtkinter as ctk
 import paramiko
 from playwright.sync_api import TimeoutError as PWTimeout
 
-from code33_app import (APP, CONFIG_PATH, CRM, LOG_DIR, Cancelled, Shell, build_commands, keyring,
+import sys
+
+# this app's own folder (next to the .py, or next to NOCTools.exe)
+HERE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+# the code 33 / code 13 files can be next to this file or in the sibling folders ../code33 and ../code13
+for sub in ("code33", "code13"):
+    sys.path.insert(0, os.path.join(HERE, "..", sub))
+
+from code33_app import (APP, CRM, LOG_DIR, Cancelled, Shell, build_commands, keyring,
                         parse_message, run_flow, test_crm, to_local, validate)
 from code13_app import normalize_local, run_code13, test_code13
 import code33_app
@@ -74,7 +82,7 @@ def _remembered_login(self, crm_password):
 
 code33_app.CRM.ensure_login = _remembered_login   # CRM13 (code 13) inherits it too
 
-TOOLS_CONFIG = os.path.join(os.path.dirname(CONFIG_PATH), "noc_tools.ini")
+TOOLS_CONFIG = os.path.join(HERE, "noc_tools.ini")
 
 
 def short(err, n=110):
@@ -204,9 +212,10 @@ class StepList(ctk.CTkFrame):
         for n, text in enumerate(labels, 1):
             row = ctk.CTkFrame(self.body, fg_color="transparent")
             row.pack(fill="x", pady=4)
-            dot = ctk.CTkLabel(row, text=str(n), width=28, height=28, corner_radius=14, fg_color=C["idle"],
-                               text_color=C["text"], font=font(12, "bold"))
+            dot = ctk.CTkLabel(row, text=str(n), width=30, height=30, corner_radius=15, fg_color=C["idle"],
+                               text_color=C["text"], font=font(11, "bold"))
             dot.pack(side="left", padx=(4, 10))
+            dot.pack_propagate(False)
             col = ctk.CTkFrame(row, fg_color="transparent")
             col.pack(side="left", fill="x", expand=True)
             name = ctk.CTkLabel(col, text=text, font=font(13), text_color=C["muted"], anchor="w", justify="left")
@@ -318,6 +327,10 @@ class Code13Tracker:
             s.start(1)
         elif m := re.match(r"\*\*\* Correct CRM IMSI.*?(\d{15})", line):
             s.detail(1, f"Correct IMSI {m.group(1)}")
+        elif line.startswith("CRM: checking the EDA SIM"):
+            s.detail(1, s.rows[1]["detail"].cget("text") + "   checking the EDA SIM…")
+        elif line.startswith("CRM: EDA SIM is OK to use"):
+            s.detail(1, s.rows[1]["detail"].cget("text").replace("checking the EDA SIM…", "EDA SIM OK"))
         elif line.startswith("CRM: network status") and s.current == 1:
             s.done(1)
             s.detail(1, (s.rows[1]["detail"].cget("text") + "   " + line.split("=", 1)[1].split("(")[0].strip()))
@@ -647,7 +660,9 @@ class NocTools(ctk.CTk):
         if ok and err == "cancelled":
             self.steps.result(True, "Stopped. Nothing was changed.")
         elif not ok:
-            self.steps.result(False, f"{code} stopped at the red step. The log says what to finish by hand.")
+            untouched = self.page == "13" and self.steps.current is not None and self.steps.current <= 1
+            self.steps.result(False, "Stopped before changing anything. Nothing was changed." if untouched else
+                              f"{code} stopped at the red step. The log says what to finish by hand.")
             messagebox.showerror(APP, f"{code} failed\n\n{err}\n\nThe log has the details.", parent=self)
         elif self.action.startswith("run") and self.dry.get():
             self.steps.result(True, "Dry run finished. Nothing was changed.")
@@ -898,6 +913,10 @@ class NocTools(ctk.CTk):
             errs.append("IMSI from EDA: 15 digits starting with 425.")
         if errs:
             messagebox.showerror(APP, "\n".join(errs), parent=self)
+            return None
+        if eda.startswith("42501") and not messagebox.askyesno(
+                APP, f"{eda} starts with 42501, which looks like an IMSI2.\n\n"
+                     f"Code 13 needs the main IMSI from EDA (usually 42509…).\n\nUse {eda} anyway?", parent=self):
             return None
         return {"local": local, "eda": eda}
 

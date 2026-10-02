@@ -9,7 +9,7 @@ Line has code 13 = the IMSI in the network (EDA) is different from the IMSI in t
 5. סטטוס מנוי ברשת must show CONNECTED (if still code 13: מושהה -> בשימוש once more)
 Closing the ticket stays manual.
 
-Run:  python code13_app.py      (code33_app.py must be in the same folder)
+Run:  python code13_app.py      (code33_app.py in the same folder or in ../code33)
 """
 import datetime
 import os
@@ -24,11 +24,18 @@ import configparser
 
 from playwright.sync_api import TimeoutError as PWTimeout
 
-# shared parts from the code 33 app (browser/CRM login, config, passwords)
-from code33_app import APP, CONFIG_PATH, CRM, LOG_DIR, Cancelled, keyring, simpledialog
+import sys
 
-# code 13 has its own settings file, next to the app
-CONFIG13_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "config13.ini")
+# this app's own folder (next to the .py, or next to Code13.exe)
+HERE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+# code33_app.py can be next to this file or in the sibling folder ..\code33
+sys.path.insert(0, os.path.join(HERE, "..", "code33"))
+
+# shared parts from the code 33 app (browser/CRM login, config, passwords)
+from code33_app import APP, CRM, LOG_DIR, Cancelled, keyring, simpledialog
+
+# code 13 has its own settings file, next to this app
+CONFIG13_PATH = os.path.join(HERE, "config13.ini")
 
 
 IMSI_RE = re.compile(r"\b425\d{12}\b")
@@ -93,6 +100,12 @@ class CRM13(CRM):
                 out[m.group(0)] = " | ".join(x.strip() for x in txt.split("\t") if x.strip())
         return out
 
+    def log_line(self, local, rows):
+        if not rows:
+            self.log(f"CRM:    line {local} now has no SIM in SIMS INVENTORY")
+        for txt in rows.values():
+            self.log(f"CRM:    line {local} now has: {txt}")
+
     # --- edit form of one SIM
     def _open_edit(self, local, imsi):
         p = self.page
@@ -137,7 +150,12 @@ class CRM13(CRM):
         p = self.page
         select = p.locator("select:visible", has=p.locator("option", has_text=target)).first
         select.wait_for(state="visible", timeout=10000)
+        try:
+            before = select.locator("option:checked").inner_text().strip()
+        except Exception:
+            before = "?"
         select.select_option(label=target)
+        self.log(f"CRM:    status in the form: {before} -> {target}")
 
     def _save(self):
         p = self.page
@@ -155,6 +173,7 @@ class CRM13(CRM):
                                + (" / ".join(m.strip() for m in msgs if m.strip()) or ""))
         p.wait_for_load_state("domcontentloaded")
         p.wait_for_timeout(1500)
+        self.log(f"CRM:    pressed {t} - saved (left the edit form)")
 
     def _mobile_sub_field(self, local):
         """The Mobile Subscription field = the text box that shows this line's number, and its X button."""
@@ -183,14 +202,17 @@ class CRM13(CRM):
         self.log(f"CRM: IMSI {imsi}: {what}")
         if detach:
             self._open_edit_direct(local, imsi)
+            self.log(f"CRM:    opened the SIM's own page -> {self.c['edit_text']}")
         else:
             self._open_edit(local, imsi)
+            self.log(f"CRM:    opened {self.c['edit_text']} from the line's SIMS INVENTORY")
         if status:
             self._choose_status(status)
         if detach:
             box, btn = self._mobile_sub_field(local)
             name = box.get_attribute("name") or ""
             btn.click()
+            self.log(f"CRM:    pressed X next to Mobile Subscription ({local})")
             self.page.wait_for_timeout(300)
             left = box.input_value().strip()
             if left:
@@ -203,6 +225,7 @@ class CRM13(CRM):
                     self.log(f"CRM: also cleared hidden field {name[:-5]}_id")
         self._save()
         rows = self.sim_rows(local)
+        self.log_line(local, rows)
         if detach:
             if imsi in rows:
                 self.page.wait_for_timeout(3000)
@@ -217,7 +240,7 @@ class CRM13(CRM):
             self.log(f"CRM: verified {imsi} = '{status}'.")
 
     # --- בחר window
-    def _open_select_popup(self, local, imsi):
+    def _open_select_popup(self, local, imsi, iccid=None):
         self.open_subscriber(local)
         table = self.ensure_sims_open()
         t = self.c.get("select_text", "בחר")
@@ -231,6 +254,7 @@ class CRM13(CRM):
         field = pop.locator("xpath=//*[normalize-space(text())='IMSI' or normalize-space(text())='IMSI:']"
                             "/following::input[@type='text'][1]").first
         field.fill(imsi)
+        self.log(f"CRM:    {t} window opened, typed IMSI {imsi}")
         f = self.c.get("filter_text", "מסנן")
         pop.locator(f"input[value='{f}'], button:has-text('{f}')").first.click()
         try:
@@ -244,10 +268,16 @@ class CRM13(CRM):
             pop.close()
             raise RuntimeError(f"CRM: IMSI {imsi} was not found in the {t} window.")
         pop.wait_for_timeout(500)
+        self.log(f"CRM:    {rows.count()} result(s) for {imsi}:")
+        for i in range(rows.count()):
+            self.log("CRM:      - " + " | ".join(x.strip() for x in rows.nth(i).inner_text().split("\t") if x.strip()))
         with_iccid = [rows.nth(i) for i in range(rows.count()) if ICCID_RE.search(rows.nth(i).inner_text())]
+        if iccid:
+            with_iccid = [r for r in with_iccid if iccid in r.inner_text()]
         if len(with_iccid) != 1:
             pop.close()
-            raise RuntimeError(f"CRM: expected exactly 1 result with an ICCID for IMSI {imsi}, found {len(with_iccid)}.")
+            raise RuntimeError(f"CRM: expected exactly 1 result with an ICCID"
+                               f"{' ' + iccid if iccid else ''} for IMSI {imsi}, found {len(with_iccid)}.")
         row_text = with_iccid[0].inner_text()
         other_lines = sorted(set(re.findall(r"\b05\d{8}\b", row_text)) - {local})
         if other_lines or self.c["status_in_use"] in row_text:
@@ -259,9 +289,10 @@ class CRM13(CRM):
             )
         return pop, with_iccid[0]
 
-    def attach_sim(self, local, imsi):
-        self.log(f"CRM: attaching IMSI {imsi} to {local} ({self.c.get('select_text', 'בחר')})")
-        pop, row = self._open_select_popup(local, imsi)
+    def attach_sim(self, local, imsi, iccid=None):
+        self.log(f"CRM: attaching IMSI {imsi}{' / ICCID ' + iccid if iccid else ''} to {local} "
+                 f"({self.c.get('select_text', 'בחר')})")
+        pop, row = self._open_select_popup(local, imsi, iccid)
         self.log("CRM: chosen row: " + " | ".join(x.strip() for x in row.inner_text().split("\t") if x.strip()))
         row.locator("a", has_text=imsi).first.click()
         try:
@@ -271,8 +302,11 @@ class CRM13(CRM):
             pass
         self.page.wait_for_timeout(1500)
         rows = self.sim_rows(local)
+        self.log_line(local, rows)
         if imsi not in rows:
             raise RuntimeError(f"CRM: IMSI {imsi} does not appear on the line after choosing it.")
+        if iccid and iccid not in rows[imsi]:
+            raise RuntimeError(f"CRM: IMSI {imsi} is on the line but with a different ICCID (expected {iccid}).")
         self.log(f"CRM: verified {imsi} is on the line: {rows[imsi]}")
 
     # --- סטטוס מנוי ברשת
@@ -321,6 +355,29 @@ class CRM13(CRM):
         return status
 
 
+def restore_line(crm, local, good, good_iccid, eda, S, U, log):
+    """Bring the line back to how it was: EDA SIM off the line, the original SIM (same IMSI + ICCID) on it, in use."""
+    rows = crm.sim_rows(local)
+    log("↩ restore - the line right now:")
+    crm.log_line(local, rows)
+    if eda in rows:
+        log(f"↩ restore: removing the EDA SIM {eda} from the line")
+        if U in rows[eda]:
+            crm.edit_sim(local, eda, status=S)
+        crm.edit_sim(local, eda, detach=True)
+        rows = crm.sim_rows(local)
+    if good not in rows:
+        log(f"↩ restore: attaching the original SIM {good} / ICCID {good_iccid}")
+        crm.attach_sim(local, good, good_iccid)
+        rows = crm.sim_rows(local)
+    if U not in rows.get(good, ""):
+        log(f"↩ restore: setting {good} back to {U}")
+        crm.edit_sim(local, good, status=U)
+        rows = crm.sim_rows(local)
+    if good_iccid and good_iccid not in rows.get(good, ""):
+        raise RuntimeError(f"the original SIM {good} is back but its ICCID is not {good_iccid}")
+
+
 def run_code13(cfg, v, secrets, log, ask, dry_run):
     local, eda = v["local"], v["eda"]
     c = cfg["crm"]
@@ -344,7 +401,8 @@ def run_code13(cfg, v, secrets, log, ask, dry_run):
         return
 
     crm = CRM13(cfg, log)
-    done, good = [], None
+    done, good, good_iccid, changing = [], None, None, False
+    log(f"Code 13 started for {local}, EDA IMSI {eda}")
     try:
         crm.start()
         crm.ensure_login(secrets.get("crm"))
@@ -358,7 +416,22 @@ def run_code13(cfg, v, secrets, log, ask, dry_run):
         if len(in_use) != 1:
             raise RuntimeError(f"Expected exactly one SIM '{U}' on the line, found {len(in_use)}. Nothing was changed.")
         good = in_use[0]
+        m = ICCID_RE.search(rows[good])
+        good_iccid = m.group(0) if m else None
+        before = rows[good]
         log(f"*** Correct CRM IMSI (will be put back at the end): {good}")
+        log(f"    original SIM: IMSI {good}, ICCID {good_iccid or 'unknown'}  ({before})")
+
+        # check the EDA SIM BEFORE changing anything: it must exist with an ICCID and must not be
+        # in use / attached to another line - otherwise stop now, while the line is still untouched
+        log(f"CRM: checking the EDA SIM {eda} in the {c.get('select_text', 'בחר')} window (no changes)...")
+        pop, row = crm._open_select_popup(local, eda)
+        eda_row = row.inner_text()
+        m = ICCID_RE.search(eda_row)
+        eda_iccid = m.group(0) if m else None
+        log("CRM: EDA SIM is OK to use: " + " | ".join(x.strip() for x in eda_row.split("\t") if x.strip()))
+        log(f"    EDA SIM: IMSI {eda}, ICCID {eda_iccid or 'unknown'}")
+        pop.close()
 
         if crm.network_status(local) == "CONNECTED" and not ask(
                 f"The line {local} already shows CONNECTED (no code 13).\n\nContinue with the code 13 fix anyway?"):
@@ -367,17 +440,21 @@ def run_code13(cfg, v, secrets, log, ask, dry_run):
         steps = [
             (f"{good} -> {S}", lambda: crm.edit_sim(local, good, status=S)),
             (f"remove {good} from the line", lambda: crm.edit_sim(local, good, detach=True)),
-            (f"attach EDA IMSI {eda}", lambda: crm.attach_sim(local, eda)),
+            (f"attach EDA IMSI {eda}", lambda: crm.attach_sim(local, eda, eda_iccid)),
             (f"{eda} -> {U}", lambda: crm.edit_sim(local, eda, status=U)),
             (f"{eda} -> {S}", lambda: crm.edit_sim(local, eda, status=S)),
             (f"remove {eda} from the line", lambda: crm.edit_sim(local, eda, detach=True)),
-            (f"attach {good} back", lambda: crm.attach_sim(local, good)),
+            (f"attach {good} back", lambda: crm.attach_sim(local, good, good_iccid)),
             (f"{good} -> {U}", lambda: crm.edit_sim(local, good, status=U)),
         ]
+        changing = True
+        t_all = time.time()
         for n, (name, fn) in enumerate(steps, 1):
             log(f"=== step {n}/{len(steps)}: {name} ===")
+            t0 = time.time()
             fn()
             done.append(name)
+            log(f"    step {n} done in {time.time() - t0:.0f}s")
 
         status = None
         for _ in range(3):
@@ -394,10 +471,29 @@ def run_code13(cfg, v, secrets, log, ask, dry_run):
             status = crm.network_status(local)
         if status != "CONNECTED":
             raise RuntimeError(f"All CRM steps were done, but the network status is {status}.")
+        after = crm.sim_rows(local)
+        log("──── summary ────")
+        log(f"  line:        {local}")
+        log(f"  before:      {before}")
+        for txt in after.values():
+            log(f"  after:       {txt}")
+        log(f"  EDA SIM:     {eda} / {eda_iccid or '?'} -> {S}, not on the line")
+        log(f"  total time:  {time.time() - t_all:.0f}s")
         log(f"✅ {local} is CONNECTED with IMSI {good}.")
     except Cancelled:
         raise
-    except Exception:
+    except Exception as first_error:
+        if good and changing:
+            log(f"‼ Stopped in the middle ({first_error}). Putting the correct SIM {good} back on the line...")
+            try:
+                restore_line(crm, local, good, good_iccid, eda, S, U, log)
+                log(f"↩ Restored: {good} is back on the line, {U}. The line is as it was before the run.")
+                raise RuntimeError(f"{first_error}\n\nThe correct SIM {good} was put back on the line ({U}) - "
+                                   f"the line is as it was before the run.")
+            except Exception as e:
+                if str(e).startswith(str(first_error)):
+                    raise
+                log(f"‼ The automatic restore also failed: {e}")
         if good:
             log("‼ STOPPED - finish manually in the CRM:")
             log(f"   correct IMSI (must end up on the line, {U}): {good}")
