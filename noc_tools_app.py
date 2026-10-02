@@ -82,6 +82,136 @@ def _remembered_login(self, crm_password):
 
 code33_app.CRM.ensure_login = _remembered_login   # CRM13 (code 13) inherits it too
 
+
+# ----------------------------------------------------------------------------- CUDBSUE sending (NOC Tools' own copy)
+# NOC Tools uses its own, up-to-date command sending, whatever version of code33_app.py sits next to it:
+# - one command at a time, reading the result as soon as it arrives (it often comes together with ORDERED)
+# - any answer from the CUDB counts as done (12001 "not defined", 2001 "format error", COMPLETED ...)
+# - only "busy" (1093/1098) is retried, and after a few busy commands in a row it stops and the SIM is restored
+STATUS_RE = re.compile(r"(\d+)\s+([A-Z]+)\s+CUDBSUE")
+BUSY_FAULTS = ("1093", "1098")  # too many transactions at once / no free handler -> wait and retry
+
+
+def final_re(job):
+    # the job's final line, e.g. "443932 COMPLETED CUDBSUE" / "443933 FAILED CUDBSUE" (not ORDERED / RESULT / FAULT)
+    return rf"(?<!\d){job}\s+(?!ORDERED\b|RESULT\b|FAULT\b)([A-Z]+)\s+CUDBSUE"
+
+
+def run_one(sh, cmd, t, r, log):
+    """Send one command and wait until the CUDB reports its FINAL result (not just ORDERED)."""
+    timeout = int(r.get("result_timeout", "30"))
+    sh.send(cmd)
+    out = sh.expect(t["mml_prompt"], timeout)
+    m = STATUS_RE.search(out)
+    if not m:
+        return "UNKNOWN", out
+    job = m.group(1)
+    done = re.search(final_re(job), out)
+    if done:  # the result often arrives together with ORDERED, in the same output
+        return done.group(1), out
+    try:
+        res = sh.expect(final_re(job), timeout)
+        res += sh.expect(t["mml_prompt"], 15)
+        out += res
+        return re.search(final_re(job), out).group(1), out
+    except TimeoutError:
+        log(f"  ⚠ job {job}: no final result within {timeout}s")
+        return "NO RESULT", out
+
+
+class CudbBusy(RuntimeError):
+    pass
+
+
+def run_with_retry(sh, cmd, t, r, log):
+    """Returns (status, busy, fault code, fault message)."""
+    retries, wait = int(r.get("busy_retries", "2")), float(r.get("busy_wait", "3"))
+    for attempt in range(retries + 1):
+        status, out = run_one(sh, cmd, t, r, log)
+        fault = re.search(r"FAULT CODE (\d+)", out)
+        code = fault.group(1) if fault else ""
+        msg = re.search(r"FAULT MSG ([^\r\n]+)", out)
+        busy = status == "FAILED" and code in BUSY_FAULTS
+        if busy and attempt < retries:
+            log(f"  … CUDB busy (fault {code}), retry {attempt + 1}/{retries} in {wait:g}s")
+            time.sleep(wait)
+            continue
+        return status, busy, code, (msg.group(1).strip() if msg else "")
+
+
+def run_mml(cfg, secrets, commands, log):
+    s, t, r = cfg["ssh"], cfg["telnet"], cfg["run"]
+    repeat = int(r.get("repeat", "3"))
+    delay = float(r.get("command_delay", "0.3"))
+    log(f"SSH: connecting to {s['user']}@{s['host']}...")
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(s["host"], int(s.get("port", "22")), s["user"], secrets["ssh"],
+                   look_for_keys=False, allow_agent=False, timeout=20)
+    ok, faults = set(), {}
+    ok_faults = tuple(x.strip() for x in r.get("ok_faults", "12001").split(",") if x.strip())
+    max_busy = int(r.get("stop_after_busy_commands", "3"))
+    busy_in_a_row = 0
+    try:
+        sh = Shell(client.invoke_shell(width=300, height=200), log)
+        sh.expect(s["shell_prompt"], 20)
+        sh.send(f"telnet {t['host']} {t['port']}")
+        sh.expect(t["login_prompt"], 30)
+        sh.send(t["user"])
+        sh.expect(t["password_prompt"], 20)
+        sh.send(secrets["telnet"], secret=True)
+        sh.expect(t["mml_prompt"], 30)
+        log("TELNET: logged in.")
+        for i in range(1, repeat + 1):
+            log(f"--- round {i}/{repeat} ---")
+            good = 0
+            for n, cmd in enumerate(commands):
+                status, busy, code, msg = run_with_retry(sh, cmd, t, r, log)
+                if status == "FAILED" and code in ok_faults:
+                    # e.g. 12001 IDENTIFIER NOT DEFINED = this identity is not in the CUDB -> nothing to do
+                    log(f"  ✓ answered: fault {code} ({msg})")
+                    ok.add(n)
+                    good += 1
+                    busy_in_a_row = 0
+                elif status == "FAILED" and code and not busy:
+                    # the CUDB answered with another fault (e.g. 2001 FORMAT ERROR) - noted, not retried
+                    log(f"  ⚠ answered with fault {code} ({msg}): {cmd}")
+                    faults[n] = f"{code} {msg}"
+                    ok.add(n)
+                    good += 1
+                    busy_in_a_row = 0
+                elif status in ("FAILED", "UNKNOWN", "NO RESULT"):
+                    log(f"  ✖ {status}: {cmd}")
+                    busy_in_a_row = busy_in_a_row + 1 if busy else 0
+                    if busy_in_a_row >= max_busy:
+                        raise CudbBusy(
+                            f"The CUDB is busy: {busy_in_a_row} commands in a row failed with 'resource limitation' "
+                            f"(fault 1093/1098), even after retries. Stopped early so the SIM is not left "
+                            f"suspended - try again in a few minutes, or check the CUDB/PG.")
+                else:
+                    ok.add(n)
+                    good += 1
+                    busy_in_a_row = 0
+                time.sleep(delay)
+            log(f"--- round {i}: {good}/{len(commands)} OK ---")
+        sh.send(t.get("exit_command", "exit;"))
+        time.sleep(1)
+    finally:
+        client.close()
+    failed = [c for n, c in enumerate(commands) if n not in ok]
+    if failed:
+        raise RuntimeError(f"{len(failed)} command(s) did not succeed in any round:\n" + "\n".join(failed))
+    if faults:
+        log(f"⚠ {len(faults)} command(s) were answered with a fault (see above):")
+        for n, f in faults.items():
+            log(f"    {commands[n]}  ->  {f}")
+    log(f"TELNET: done - all {len(commands)} commands were answered by the CUDB.")
+
+
+
+
+code33_app.run_mml = run_mml   # run_flow (code 33 + queue) now sends the commands this way
+
 TOOLS_CONFIG = os.path.join(HERE, "noc_tools.ini")
 
 
