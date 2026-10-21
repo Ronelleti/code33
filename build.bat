@@ -12,6 +12,7 @@ pyinstaller --noconfirm --onefile --windowed --name NOCTools ^
 
 pyinstaller --noconfirm --onefile --windowed --name NOCToolsV2 ^
   --icon icons\noc_tools.ico --add-data "icons\noc_tools.ico;icons" ^
+  --add-binary "C:\Windows\System32\msvcp140.dll;." --add-binary "C:\Windows\System32\vcruntime140_1.dll;." ^
   --hidden-import keyring.backends.Windows --collect-all customtkinter noc_tools_v2_app.py
 
 if exist config13.ini  (copy /Y config13.ini   dist\config13.ini)
