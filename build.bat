@@ -10,8 +10,12 @@ pyinstaller --noconfirm --onefile --windowed --name NOCTools ^
   --icon icons\noc_tools.ico --add-data "icons\noc_tools.ico;icons" ^
   --hidden-import keyring.backends.Windows --collect-all customtkinter noc_tools_app.py
 
-if exist config13.ini   (copy /Y config13.ini   dist\config13.ini)
+pyinstaller --noconfirm --onefile --windowed --name NOCToolsV2 ^
+  --icon icons\noc_tools.ico --add-data "icons\noc_tools.ico;icons" ^
+  --hidden-import keyring.backends.Windows --collect-all customtkinter noc_tools_v2_app.py
+
+if exist config13.ini  (copy /Y config13.ini   dist\config13.ini)
 if exist noc_tools.ini  (copy /Y noc_tools.ini  dist\noc_tools.ini)
 echo.
-echo Done: dist\Code13.exe + config13.ini   and   dist\NOCTools.exe + noc_tools.ini
+echo Done: dist\Code13.exe + config13.ini,  dist\NOCTools.exe and dist\NOCToolsV2.exe + noc_tools.ini
 pause
