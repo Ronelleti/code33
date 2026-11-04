@@ -702,9 +702,9 @@ READ_5G_JS = """() => {
 }"""
 
 
-def read_5g(crm, local, log):
+def read_5g(crm, local, log, imsi=None):
     """True / False for the '5G:' box on the subscriber page (X = set), None when it cannot be told."""
-    crm.open_subscriber(local)
+    crm.open_subscriber(local, imsi or None)   # same number twice -> pick the subscriber that holds this IMSI
     crm.page.wait_for_timeout(1000)
     return crm.page.evaluate(READ_5G_JS)
 
@@ -1592,7 +1592,7 @@ class NocTools(ctk.CTk):
         try:
             crm.start()
             crm.ensure_login(None)
-            five_g = read_5g(crm, local, log)
+            five_g = read_5g(crm, local, log, v.get("imsi1") or v.get("imsi2"))
         finally:
             try:
                 crm.stop()
