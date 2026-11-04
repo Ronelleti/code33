@@ -1,4 +1,6 @@
 playwright>=1.45
 paramiko>=3.4
+# cryptography 50 ships a Python 3.15 "abi3t" build that fails inside PyInstaller exes (DLL load failed: _rust)
+cryptography>=43,<47
 keyring>=25
 customtkinter>=5.2

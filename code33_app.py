@@ -148,28 +148,53 @@ class CRM:
         p.wait_for_load_state("domcontentloaded")
         self.log("CRM: logged in.")
 
-    def open_subscriber(self, local):
+    def open_subscriber(self, local, imsi=None):
+        """Open the subscriber page for `local`. The same number can exist twice (one deactivated, one
+        activated). When `imsi` is given, try each match until the one whose SIMS INVENTORY holds that IMSI."""
         p = self.page
-        search_url = self.c.get("search_url", "").strip()
-        if search_url:
-            # open the search results page directly - no need to find the search box
-            p.goto(search_url.format(query=local))
-        else:
-            p.goto(self.c["url"])
-            box = self._search_box()
-            box.fill(local)
-            box.press("Enter")
-        # the number also appears in the hidden "recently viewed" menu, so only take a visible link
-        # skip the "recently viewed" side menu (it also shows the number) - take the link in the results
-        link = p.locator("a:not(.recent-links-detail)", has_text=local).locator("visible=true").first
-        link.wait_for(state="visible")
-        link.click()
-        # the same text also exists in the (hidden) top menu, so only look at visible matches
-        p.get_by_text(self.c["sims_section_text"], exact=False).locator("visible=true").first.wait_for(
-            state="visible"
-        )
 
-    def sim_row(self, imsi):
+        def search():
+            search_url = self.c.get("search_url", "").strip()
+            if search_url:
+                # open the search results page directly - no need to find the search box
+                p.goto(search_url.format(query=local))
+            else:
+                p.goto(self.c["url"])
+                box = self._search_box()
+                box.fill(local)
+                box.press("Enter")
+            # skip the "recently viewed" side menu (it also shows the number) - take the links in the results
+            links = p.locator("a:not(.recent-links-detail)", has_text=local).locator("visible=true")
+            links.first.wait_for(state="visible")
+            return links
+
+        def enter(links, i):
+            links.nth(i).click()
+            # the same text also exists in the (hidden) top menu, so only look at visible matches
+            p.get_by_text(self.c["sims_section_text"], exact=False).locator("visible=true").first.wait_for(
+                state="visible"
+            )
+
+        links = search()
+        count = links.count()
+        if not imsi or count <= 1:
+            enter(links, 0)
+            return
+        for i in range(count):
+            if i:
+                links = search()
+                if links.count() <= i:
+                    break
+            enter(links, i)
+            try:
+                self.sim_row(imsi, timeout=8000)
+                self.log(f"CRM: {count} subscribers share {local}; using #{i + 1} (it holds IMSI {imsi}).")
+                return
+            except RuntimeError:
+                self.log(f"CRM: subscriber #{i + 1} of {count} does not hold IMSI {imsi}, trying the next one...")
+        raise RuntimeError(f"CRM: IMSI {imsi} was not found in SIMS INVENTORY of any subscriber with {local}.")
+
+    def sim_row(self, imsi, timeout=30000):
         p = self.page
         row = (p.locator("tr", has_text=imsi).filter(has=p.get_by_text(self.c["edit_text"]))
                .locator("visible=true").first)
@@ -184,7 +209,7 @@ class CRM:
         header.scroll_into_view_if_needed()
         header.click()
         try:
-            row.wait_for(state="visible")
+            row.wait_for(state="visible", timeout=timeout)
         except PWTimeout:
             raise RuntimeError(f"CRM: IMSI {imsi} was not found in SIMS INVENTORY for this number.")
         row.scroll_into_view_if_needed()
@@ -193,7 +218,7 @@ class CRM:
     def set_status(self, local, imsi, target):
         p = self.page
         self.log(f"CRM: {local} / IMSI {imsi} -> {target}")
-        self.open_subscriber(local)
+        self.open_subscriber(local, imsi)
         row = self.sim_row(imsi)
         if target in row.inner_text():
             self.log(f"CRM: already '{target}', nothing to change.")
@@ -219,7 +244,7 @@ class CRM:
         p.wait_for_timeout(1500)
 
         # verify by reloading the subscriber
-        self.open_subscriber(local)
+        self.open_subscriber(local, imsi)
         text = self.sim_row(imsi).inner_text()
         if target not in text:
             raise RuntimeError(f"CRM: status did not change to '{target}'. Row now shows: {text!r}")
@@ -373,7 +398,7 @@ def test_crm(cfg, v, secrets, log):
         crm.start()
         crm.ensure_login(secrets.get("crm"))
         local = to_local(v["msisdn"])
-        crm.open_subscriber(local)
+        crm.open_subscriber(local, v["imsi1"])
         row = crm.sim_row(v["imsi1"])
         row.highlight()
         log("CRM test OK. Row: " + " | ".join(x.strip() for x in row.inner_text().split("\t") if x.strip()))
