@@ -1,0 +1,49 @@
+name: Build exes
+
+# Run it by hand: GitHub -> Actions -> "Build exes" -> Run workflow (pick the branch, e.g. dev)
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install requirements
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build Code13.exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name Code13
+          --icon icons\code13.ico --add-data "icons\code13.ico;icons"
+          --hidden-import keyring.backends.Windows code13_app.py
+
+      - name: Build NOCTools.exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name NOCTools
+          --icon icons\noc_tools.ico --add-data "icons\noc_tools.ico;icons"
+          --hidden-import keyring.backends.Windows --collect-all customtkinter noc_tools_app.py
+
+      - name: Build NOCToolsV2.exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name NOCToolsV2
+          --icon icons\noc_tools.ico --add-data "icons\noc_tools.ico;icons"
+          --add-binary "C:\Windows\System32\msvcp140.dll;." --add-binary "C:\Windows\System32\vcruntime140_1.dll;."
+          --hidden-import keyring.backends.Windows --collect-all customtkinter noc_tools_v2_app.py
+
+      - name: Copy the settings files next to the exes
+        shell: pwsh
+        run: |
+          if (Test-Path config13.ini) { Copy-Item config13.ini dist\ }
+          if (Test-Path noc_tools.ini) { Copy-Item noc_tools.ini dist\ }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exes
+          path: dist/*
